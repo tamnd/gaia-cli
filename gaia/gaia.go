@@ -1,35 +1,36 @@
 // Package gaia is the library behind the gaia command line:
-// the HTTP client, request shaping, and the typed data models for gaia.
+// the HTTP client, request shaping, and the typed data models for ESA Gaia DR3.
 //
 // The Client here is the spine every command shares. It sets a real
 // User-Agent, paces requests so a busy session stays polite, and retries the
-// transient failures (429 and 5xx) that any public site throws under load.
-// Build your endpoint calls and JSON decoding on top of it.
+// transient failures (429 and 5xx) that any public service throws under load.
 package gaia
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"regexp"
+	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
 
-// DefaultUserAgent identifies the client to gaia. A real, honest
-// User-Agent is both polite and the thing most likely to keep you unblocked.
-const DefaultUserAgent = "gaia/dev (+https://github.com/tamnd/gaia-cli)"
+// DefaultUserAgent identifies the client to the ESA TAP service.
+const DefaultUserAgent = "gaia-cli/dev (+https://github.com/tamnd/gaia-cli)"
 
-// Host is the site this client talks to, and the host the URI driver in
-// domain.go claims. The scaffold points it at gaia.com; change it once you
-// know the real endpoints you want to read.
-const Host = "gaia.com"
+// Host is the ESA Gaia TAP server hostname.
+const Host = "gea.esac.esa.int"
 
 // BaseURL is the root every request is built from.
 const BaseURL = "https://" + Host
 
-// Client talks to gaia over HTTP.
+// tapEndpoint is the TAP sync endpoint.
+const tapEndpoint = BaseURL + "/tap-server/tap/sync"
+
+// Client talks to the ESA Gaia TAP service over HTTP.
 type Client struct {
 	HTTP      *http.Client
 	UserAgent string
@@ -40,21 +41,191 @@ type Client struct {
 	last time.Time
 }
 
-// NewClient returns a Client with sensible defaults: a 30s timeout, a 200ms
-// minimum gap between requests, and five retries on transient errors.
+// NewClient returns a Client with sensible defaults: 60s timeout (TAP can be slow),
+// 500ms minimum gap between requests, and three retries on transient errors.
 func NewClient() *Client {
 	return &Client{
-		HTTP:      &http.Client{Timeout: 30 * time.Second},
+		HTTP:      &http.Client{Timeout: 60 * time.Second},
 		UserAgent: DefaultUserAgent,
-		Rate:      200 * time.Millisecond,
-		Retries:   5,
+		Rate:      500 * time.Millisecond,
+		Retries:   3,
 	}
 }
 
-// Get fetches url and returns the response body. It paces and retries according
-// to the client's settings. The caller owns nothing extra; the body is read
-// fully and closed here.
-func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
+// Star is a single record from gaiadr3.gaia_source.
+type Star struct {
+	ID           string  `json:"id"                       kit:"id"`
+	RA           float64 `json:"ra"`
+	Dec          float64 `json:"dec"`
+	Parallax     float64 `json:"parallax_mas,omitempty"`
+	ParallaxErr  float64 `json:"parallax_error,omitempty"`
+	MagG         float64 `json:"mag_g,omitempty"`
+	MagBP        float64 `json:"mag_bp,omitempty"`
+	MagRP        float64 `json:"mag_rp,omitempty"`
+	ProperMotRA  float64 `json:"pmra,omitempty"`
+	ProperMotDec float64 `json:"pmdec,omitempty"`
+	RadialVel    float64 `json:"radial_velocity_km_s,omitempty"`
+}
+
+// wireTAPResponse is the raw TAP JSON envelope.
+type wireTAPResponse struct {
+	Metadata []struct {
+		Name     string `json:"name"`
+		DataType string `json:"datatype"`
+	} `json:"metadata"`
+	Data [][]json.RawMessage `json:"data"`
+}
+
+// QueryTAP executes an ADQL query against the ESA Gaia TAP service and returns
+// the rows as a slice of maps keyed by column name.
+func (c *Client) QueryTAP(ctx context.Context, adql string, limit int) ([]map[string]interface{}, error) {
+	q := url.Values{}
+	q.Set("REQUEST", "doQuery")
+	q.Set("LANG", "ADQL")
+	q.Set("FORMAT", "json")
+	q.Set("MAXREC", strconv.Itoa(limit))
+	q.Set("QUERY", adql)
+	endpoint := tapEndpoint + "?" + q.Encode()
+
+	body, err := c.Get(ctx, endpoint)
+	if err != nil {
+		return nil, err
+	}
+
+	var resp wireTAPResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("tap parse: %w", err)
+	}
+
+	rows := make([]map[string]interface{}, 0, len(resp.Data))
+	for _, row := range resp.Data {
+		m := make(map[string]interface{}, len(resp.Metadata))
+		for i, col := range resp.Metadata {
+			if i >= len(row) {
+				continue
+			}
+			// Use a decoder with UseNumber so large int64 source_ids are not
+			// silently rounded when converted to float64.
+			dec := json.NewDecoder(strings.NewReader(string(row[i])))
+			dec.UseNumber()
+			var v interface{}
+			if err := dec.Decode(&v); err == nil {
+				m[col.Name] = v
+			}
+		}
+		rows = append(rows, m)
+	}
+	return rows, nil
+}
+
+// BrightStars returns stars brighter than maxMag in the G band, sorted by
+// ascending magnitude (brightest first).
+func (c *Client) BrightStars(ctx context.Context, maxMag float64, limit int) ([]*Star, error) {
+	adql := fmt.Sprintf(
+		"SELECT TOP %d source_id,ra,dec,parallax,parallax_error,phot_g_mean_mag,phot_bp_mean_mag,phot_rp_mean_mag,pmra,pmdec "+
+			"FROM gaiadr3.gaia_source WHERE phot_g_mean_mag < %g ORDER BY phot_g_mean_mag ASC",
+		limit, maxMag,
+	)
+	rows, err := c.QueryTAP(ctx, adql, limit)
+	if err != nil {
+		return nil, err
+	}
+	return starsFromRows(rows), nil
+}
+
+// NearbyStars returns stars within radiusDeg degrees of the given ICRS coordinates.
+func (c *Client) NearbyStars(ctx context.Context, ra, dec, radiusDeg float64, limit int) ([]*Star, error) {
+	adql := fmt.Sprintf(
+		"SELECT TOP %d source_id,ra,dec,parallax,parallax_error,phot_g_mean_mag,phot_bp_mean_mag,phot_rp_mean_mag,pmra,pmdec,radial_velocity "+
+			"FROM gaiadr3.gaia_source WHERE CONTAINS(POINT('ICRS',ra,dec),CIRCLE('ICRS',%g,%g,%g))=1",
+		limit, ra, dec, radiusDeg,
+	)
+	rows, err := c.QueryTAP(ctx, adql, limit)
+	if err != nil {
+		return nil, err
+	}
+	return starsFromRows(rows), nil
+}
+
+// NearestStars returns the stars with the largest parallax (closest to Earth),
+// filtered to parallax > 100 mas (within ~10 parsecs).
+func (c *Client) NearestStars(ctx context.Context, limit int) ([]*Star, error) {
+	adql := fmt.Sprintf(
+		"SELECT TOP %d source_id,ra,dec,parallax,parallax_error,phot_g_mean_mag,phot_bp_mean_mag,phot_rp_mean_mag,pmra,pmdec,radial_velocity "+
+			"FROM gaiadr3.gaia_source WHERE parallax > 100 ORDER BY parallax DESC",
+		limit,
+	)
+	rows, err := c.QueryTAP(ctx, adql, limit)
+	if err != nil {
+		return nil, err
+	}
+	return starsFromRows(rows), nil
+}
+
+// starsFromRows converts TAP row maps into Star records.
+func starsFromRows(rows []map[string]interface{}) []*Star {
+	out := make([]*Star, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, parseStar(row))
+	}
+	return out
+}
+
+// parseStar extracts Star fields from a TAP row map.
+func parseStar(row map[string]interface{}) *Star {
+	s := &Star{}
+	// source_id is a large int64. JSON decodes it as json.Number (when using
+	// Decoder with UseNumber) or as a string if we stored it that way.
+	if v, ok := row["source_id"]; ok {
+		switch x := v.(type) {
+		case json.Number:
+			// Preserve exact integer value from the JSON number string.
+			s.ID = x.String()
+		case float64:
+			// Fall back: round-trip through the json.Number string to avoid
+			// float64 precision loss on large source_ids.
+			s.ID = strconv.FormatInt(int64(x), 10)
+		case string:
+			s.ID = x
+		default:
+			s.ID = fmt.Sprintf("%v", v)
+		}
+	}
+	s.RA = rowFloat(row, "ra")
+	s.Dec = rowFloat(row, "dec")
+	s.Parallax = rowFloat(row, "parallax")
+	s.ParallaxErr = rowFloat(row, "parallax_error")
+	s.MagG = rowFloat(row, "phot_g_mean_mag")
+	s.MagBP = rowFloat(row, "phot_bp_mean_mag")
+	s.MagRP = rowFloat(row, "phot_rp_mean_mag")
+	s.ProperMotRA = rowFloat(row, "pmra")
+	s.ProperMotDec = rowFloat(row, "pmdec")
+	s.RadialVel = rowFloat(row, "radial_velocity")
+	return s
+}
+
+// rowFloat extracts a float64 from a row map entry, handling json.Number,
+// float64, and string representations.
+func rowFloat(row map[string]interface{}, key string) float64 {
+	v, ok := row[key]
+	if !ok || v == nil {
+		return 0
+	}
+	switch x := v.(type) {
+	case json.Number:
+		f, _ := x.Float64()
+		return f
+	case float64:
+		return x
+	default:
+		f, _ := strconv.ParseFloat(fmt.Sprintf("%v", v), 64)
+		return f
+	}
+}
+
+// Get fetches a URL and returns the response body. It paces and retries
+// according to the client's settings.
+func (c *Client) Get(ctx context.Context, reqURL string) ([]byte, error) {
 	var lastErr error
 	for attempt := 0; attempt <= c.Retries; attempt++ {
 		if attempt > 0 {
@@ -64,7 +235,7 @@ func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 			case <-time.After(backoff(attempt)):
 			}
 		}
-		body, retry, err := c.do(ctx, url)
+		body, retry, err := c.do(ctx, reqURL)
 		if err == nil {
 			return body, nil
 		}
@@ -73,12 +244,12 @@ func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 			return nil, err
 		}
 	}
-	return nil, fmt.Errorf("get %s: %w", url, lastErr)
+	return nil, fmt.Errorf("get %s: %w", reqURL, lastErr)
 }
 
-func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, err error) {
+func (c *Client) do(ctx context.Context, reqURL string) (body []byte, retry bool, err error) {
 	c.pace()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 	if err != nil {
 		return nil, false, err
 	}
@@ -121,80 +292,4 @@ func backoff(attempt int) time.Duration {
 		d = 5 * time.Second
 	}
 	return d
-}
-
-// Page is the scaffold's one example record: a single page, addressed by the
-// path that names it on gaia.com. It is a stand-in for the typed records you
-// will model from the real gaia endpoints. The kit struct tags make it
-// addressable as a resource URI (see domain.go): ID is the URI id, and Body is
-// the long text `gaia cat` and the Markdown export print.
-type Page struct {
-	ID    string `json:"id" kit:"id"`
-	URL   string `json:"url"`
-	Title string `json:"title,omitempty"`
-	Body  string `json:"body,omitempty" kit:"body"`
-}
-
-// GetPage fetches one page by its path (for example "wiki/Go") and returns it as
-// a record. The scaffold keeps a plain-text preview of the response as the body;
-// replace the parsing with the real fields once you know the endpoint's shape.
-func (c *Client) GetPage(ctx context.Context, path string) (*Page, error) {
-	path = strings.Trim(path, "/")
-	url := BaseURL + "/" + path
-	body, err := c.Get(ctx, url)
-	if err != nil {
-		return nil, err
-	}
-	return &Page{ID: path, URL: url, Title: path, Body: pageText(body)}, nil
-}
-
-// PageLinks fetches a page and returns the same-host pages it links to, as page
-// stubs. It shows the member-listing pattern the URI driver relies on: every
-// stub carries enough (an id and a URL) to be addressed and followed on its own.
-func (c *Client) PageLinks(ctx context.Context, path string, limit int) ([]*Page, error) {
-	path = strings.Trim(path, "/")
-	body, err := c.Get(ctx, BaseURL+"/"+path)
-	if err != nil {
-		return nil, err
-	}
-	var out []*Page
-	seen := map[string]bool{}
-	for _, p := range linkPaths(body) {
-		if seen[p] {
-			continue
-		}
-		seen[p] = true
-		out = append(out, &Page{ID: p, URL: BaseURL + "/" + p})
-		if limit > 0 && len(out) >= limit {
-			break
-		}
-	}
-	return out, nil
-}
-
-var (
-	hrefRE = regexp.MustCompile(`href="(/[^":#?]+)"`)
-	tagRE  = regexp.MustCompile(`<[^>]+>`)
-)
-
-// linkPaths pulls the relative link targets out of an HTML response, so a list
-// op can turn each into an addressable page stub.
-func linkPaths(body []byte) []string {
-	var out []string
-	for _, m := range hrefRE.FindAllSubmatch(body, -1) {
-		if p := strings.Trim(string(m[1]), "/"); p != "" {
-			out = append(out, p)
-		}
-	}
-	return out
-}
-
-// pageText reduces an HTML response to a short plain-text preview, a stand-in
-// for the typed extract a real endpoint would hand you.
-func pageText(body []byte) string {
-	s := strings.Join(strings.Fields(tagRE.ReplaceAllString(string(body), " ")), " ")
-	if len(s) > 500 {
-		s = s[:500]
-	}
-	return s
 }

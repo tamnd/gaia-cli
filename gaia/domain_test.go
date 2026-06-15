@@ -1,9 +1,8 @@
 package gaia
 
 import (
+	"strings"
 	"testing"
-
-	"github.com/tamnd/any-cli/kit"
 )
 
 // These tests are offline: they exercise the URI driver's pure string functions
@@ -24,10 +23,14 @@ func TestDomainInfo(t *testing.T) {
 }
 
 func TestClassify(t *testing.T) {
-	cases := []struct{ in, typ, id string }{
-		{"wiki/Go", "page", "wiki/Go"},
-		{"/about/", "page", "about"},
-		{"https://" + Host + "/team/contact", "page", "team/contact"},
+	cases := []struct {
+		in  string
+		typ string
+		id  string
+	}{
+		{"137338313799478912", "star", "137338313799478912"},
+		{"5853498713190525696", "star", "5853498713190525696"},
+		{"some-non-numeric-id", "star", "some-non-numeric-id"},
 	}
 	for _, tc := range cases {
 		typ, id, err := Domain{}.Classify(tc.in)
@@ -38,39 +41,57 @@ func TestClassify(t *testing.T) {
 	}
 }
 
-func TestLocate(t *testing.T) {
-	got, err := Domain{}.Locate("page", "wiki/Go")
-	want := "https://" + Host + "/wiki/Go"
-	if err != nil || got != want {
-		t.Errorf("Locate = (%q, %v), want (%q, nil)", got, err, want)
+func TestClassifyEmpty(t *testing.T) {
+	_, _, err := Domain{}.Classify("")
+	if err == nil {
+		t.Error("Classify(\"\") should return an error")
 	}
 }
 
-// TestHostWiring mounts the driver in a kit Host (the runtime ant drives) and
-// checks the round trip: a record mints to its URI, its body is readable, and a
-// bare id resolves back to the same URI. The init in domain.go registers the
-// domain, so kit.Open finds it.
-func TestHostWiring(t *testing.T) {
-	h, err := kit.Open()
+func TestLocate(t *testing.T) {
+	got, err := Domain{}.Locate("star", "137338313799478912")
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("Locate error: %v", err)
 	}
+	if !strings.Contains(got, "gea.esac.esa.int") {
+		t.Errorf("Locate = %q, want URL containing gea.esac.esa.int", got)
+	}
+	if !strings.Contains(got, "137338313799478912") {
+		t.Errorf("Locate = %q, want URL containing source_id", got)
+	}
+}
 
-	p := &Page{ID: "wiki/Go", URL: "https://" + Host + "/wiki/Go", Title: "Go", Body: "Go is a language."}
-	u, err := h.Mint(p)
-	if err != nil {
-		t.Fatalf("Mint: %v", err)
+func TestLocateUnknownType(t *testing.T) {
+	_, err := Domain{}.Locate("planet", "42")
+	if err == nil {
+		t.Error("Locate with unknown type should return an error")
 	}
-	if want := "gaia://page/wiki/Go"; u.String() != want {
-		t.Errorf("Mint = %q, want %q", u.String(), want)
-	}
+}
 
-	if body, ok := h.Body(p); !ok || body == "" {
-		t.Errorf("Body = (%q, %v), want non-empty", body, ok)
+func TestParseStarIDString(t *testing.T) {
+	row := map[string]interface{}{
+		"source_id":        float64(137338313799478912),
+		"ra":               45.081118730187555,
+		"dec":              35.303675774754296,
+		"parallax":         0.053,
+		"phot_g_mean_mag":  12.5,
+		"radial_velocity":  22.5,
 	}
-
-	got, err := h.ResolveOn("gaia", "about")
-	if err != nil || got.String() != "gaia://page/about" {
-		t.Errorf("ResolveOn = (%q, %v), want gaia://page/about", got.String(), err)
+	s := parseStar(row)
+	if s.ID == "" {
+		t.Error("parseStar: ID must not be empty")
+	}
+	// ID must be a string, not a float.
+	if strings.Contains(s.ID, ".") || strings.Contains(s.ID, "e") {
+		t.Errorf("parseStar: ID = %q looks like a float, want plain integer string", s.ID)
+	}
+	if s.RA != 45.081118730187555 {
+		t.Errorf("parseStar: RA = %v, want 45.081118730187555", s.RA)
+	}
+	if s.MagG != 12.5 {
+		t.Errorf("parseStar: MagG = %v, want 12.5", s.MagG)
+	}
+	if s.RadialVel != 22.5 {
+		t.Errorf("parseStar: RadialVel = %v, want 22.5", s.RadialVel)
 	}
 }

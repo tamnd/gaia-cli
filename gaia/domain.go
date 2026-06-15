@@ -2,8 +2,8 @@ package gaia
 
 import (
 	"context"
-	"net/url"
-	"strings"
+	"fmt"
+	"strconv"
 
 	"github.com/tamnd/any-cli/kit"
 	"github.com/tamnd/any-cli/kit/errs"
@@ -19,9 +19,6 @@ import (
 // gaia:// URIs by routing to the operations Register installs. The same
 // Domain also builds the standalone gaia binary (see cli.NewApp), so the
 // binary and a host share one source of truth.
-//
-// This is the scaffold's starting point: one resource type, "page", served by a
-// resolver op and a list op. Add your real types here as you model the site.
 func init() { kit.Register(Domain{}) }
 
 // Domain is the gaia driver. It carries no state; the per-run client is
@@ -36,40 +33,61 @@ func (Domain) Info() kit.DomainInfo {
 		Hosts:  []string{Host},
 		Identity: kit.Identity{
 			Binary: "gaia",
-			Short:  "A command line for gaia.",
-			Long: `A command line for gaia.
+			Short:  "Query the ESA Gaia DR3 stellar catalog (1.8 billion stars).",
+			Long: `Query the ESA Gaia DR3 stellar catalog from the command line.
 
-gaia reads public gaia data over plain HTTPS, shapes it into
-clean records, and prints output that pipes into the rest of your tools. No API
-key, nothing to run alongside it.`,
+gaia talks to the ESA TAP service at gea.esac.esa.int over plain HTTPS,
+shapes the ADQL/TAP response into clean records, and prints output that
+pipes into the rest of your tools. No API key required.`,
 			Site: Host,
 			Repo: "https://github.com/tamnd/gaia-cli",
 		},
 	}
 }
 
-// Register installs the client factory and every operation onto app. A resolver
-// op (Single) names its own record type and answers `ant get`; a List op
-// enumerates a parent resource's members and answers `ant ls`.
+// Register installs the client factory and every operation onto app.
 func (Domain) Register(app *kit.App) {
 	app.SetClient(newClient)
 
-	// Resolver op: one record per id, the home of `gaia page` and
-	// `ant get gaia://page/<id>`.
-	kit.Handle(app, kit.OpMeta{Name: "page", Group: "read", Single: true,
-		Summary: "Fetch a page by path or URL", URIType: "page", Resolver: true,
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, getPage)
+	// bright — brightest stars by G-band magnitude.
+	kit.Handle(app, kit.OpMeta{
+		Name:    "bright",
+		Group:   "read",
+		List:    true,
+		Summary: "List the brightest stars by G-band magnitude",
+	}, brightCmd)
 
-	// List op: members of a page, the home of `gaia links` and `ant ls`.
-	// It emits page stubs, so every listed member is itself an addressable
-	// gaia://page/ URI a host can follow.
-	kit.Handle(app, kit.OpMeta{Name: "links", Group: "read", List: true,
-		Summary: "List the pages a page links to", URIType: "page",
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, listLinks)
+	// nearby — stars near a given sky coordinate.
+	kit.Handle(app, kit.OpMeta{
+		Name:    "nearby",
+		Group:   "read",
+		List:    true,
+		Summary: "List stars near a sky coordinate (RA DEC)",
+		Args: []kit.Arg{
+			{Name: "ra", Help: "right ascension in degrees (ICRS)"},
+			{Name: "dec", Help: "declination in degrees (ICRS)"},
+		},
+	}, nearbyCmd)
+
+	// nearest — stars closest to Earth by parallax.
+	kit.Handle(app, kit.OpMeta{
+		Name:    "nearest",
+		Group:   "read",
+		List:    true,
+		Summary: "List the nearest stars (largest parallax)",
+	}, nearestCmd)
+
+	// query — raw ADQL passthrough.
+	kit.Handle(app, kit.OpMeta{
+		Name:    "query",
+		Group:   "read",
+		List:    true,
+		Summary: "Run a raw ADQL query against gaiadr3.gaia_source",
+		Args:    []kit.Arg{{Name: "adql", Help: "ADQL query string"}},
+	}, queryCmd)
 }
 
-// newClient builds the client from the host-resolved config, so a host and the
-// standalone binary pace and identify themselves the same way.
+// newClient builds the client from the host-resolved config.
 func newClient(_ context.Context, cfg kit.Config) (any, error) {
 	c := NewClient()
 	if cfg.UserAgent != "" {
@@ -88,86 +106,153 @@ func newClient(_ context.Context, cfg kit.Config) (any, error) {
 }
 
 // --- inputs ---
-//
-// Each handler takes a typed input struct. kit fills the fields from the tags:
-// kit:"arg" is a positional argument, kit:"flag,inherit" binds the framework's
-// shared flag of the same name, and kit:"inject" receives the client newClient
-// builds.
 
-type pageRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
+type brightInput struct {
+	MaxMag float64 `kit:"flag" help:"maximum G-band magnitude (default 8)"`
+	Limit  int     `kit:"flag,inherit" help:"max results"`
 	Client *Client `kit:"inject"`
 }
 
-type listRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
+type nearbyInput struct {
+	RA     string  `kit:"arg"  help:"right ascension in degrees (ICRS)"`
+	Dec    string  `kit:"arg"  help:"declination in degrees (ICRS)"`
+	Radius float64 `kit:"flag" help:"search radius in degrees (default 0.5)"`
+	Limit  int     `kit:"flag,inherit" help:"max results"`
+	Client *Client `kit:"inject"`
+}
+
+type nearestInput struct {
+	Limit  int     `kit:"flag,inherit" help:"max results"`
+	Client *Client `kit:"inject"`
+}
+
+type queryInput struct {
+	ADQL   string  `kit:"arg"          help:"ADQL query string"`
 	Limit  int     `kit:"flag,inherit" help:"max results"`
 	Client *Client `kit:"inject"`
 }
 
 // --- handlers ---
 
-func getPage(ctx context.Context, in pageRef, emit func(*Page) error) error {
-	p, err := in.Client.GetPage(ctx, pagePath(in.Ref))
-	if err != nil {
-		return mapErr(err)
+func brightCmd(ctx context.Context, in brightInput, emit func(*Star) error) error {
+	maxMag := in.MaxMag
+	if maxMag == 0 {
+		maxMag = 8
 	}
-	return emit(p)
-}
-
-func listLinks(ctx context.Context, in listRef, emit func(*Page) error) error {
-	pages, err := in.Client.PageLinks(ctx, pagePath(in.Ref), in.Limit)
-	if err != nil {
-		return mapErr(err)
+	limit := in.Limit
+	if limit <= 0 {
+		limit = 25
 	}
-	for _, p := range pages {
-		if err := emit(p); err != nil {
+	stars, err := in.Client.BrightStars(ctx, maxMag, limit)
+	if err != nil {
+		return err
+	}
+	for _, s := range stars {
+		if err := emit(s); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// --- Resolver: the URI-native string functions, pure and network-free ---
-
-// Classify turns any accepted input — a bare path or a full gaia.com URL —
-// into the canonical (type, id), so `ant resolve` and `ant url` touch no network.
-func (Domain) Classify(input string) (uriType, id string, err error) {
-	id = pagePath(input)
-	if id == "" {
-		return "", "", errs.Usage("unrecognized gaia reference: %q", input)
+func nearbyCmd(ctx context.Context, in nearbyInput, emit func(*Star) error) error {
+	ra, err := strconv.ParseFloat(in.RA, 64)
+	if err != nil {
+		return errs.Usage("ra must be a number in degrees, got %q", in.RA)
 	}
-	return "page", id, nil
+	dec, err := strconv.ParseFloat(in.Dec, 64)
+	if err != nil {
+		return errs.Usage("dec must be a number in degrees, got %q", in.Dec)
+	}
+	radius := in.Radius
+	if radius <= 0 {
+		radius = 0.5
+	}
+	limit := in.Limit
+	if limit <= 0 {
+		limit = 25
+	}
+	stars, err := in.Client.NearbyStars(ctx, ra, dec, radius, limit)
+	if err != nil {
+		return err
+	}
+	for _, s := range stars {
+		if err := emit(s); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
-// Locate is the inverse: the live https URL for a (type, id).
+func nearestCmd(ctx context.Context, in nearestInput, emit func(*Star) error) error {
+	limit := in.Limit
+	if limit <= 0 {
+		limit = 25
+	}
+	stars, err := in.Client.NearestStars(ctx, limit)
+	if err != nil {
+		return err
+	}
+	for _, s := range stars {
+		if err := emit(s); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// rawRow is emitted by the query command so callers get plain maps.
+type rawRow struct {
+	ID   string                 `json:"id"   kit:"id"`
+	Data map[string]interface{} `json:"data"`
+}
+
+func queryCmd(ctx context.Context, in queryInput, emit func(*rawRow) error) error {
+	limit := in.Limit
+	if limit <= 0 {
+		limit = 25
+	}
+	rows, err := in.Client.QueryTAP(ctx, in.ADQL, limit)
+	if err != nil {
+		return err
+	}
+	for i, row := range rows {
+		rr := &rawRow{
+			ID:   fmt.Sprintf("%d", i),
+			Data: row,
+		}
+		// Use source_id as ID when present.
+		if sid, ok := row["source_id"]; ok && sid != nil {
+			switch x := sid.(type) {
+			case float64:
+				rr.ID = strconv.FormatInt(int64(x), 10)
+			case string:
+				rr.ID = x
+			}
+		}
+		if err := emit(rr); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// --- Resolver: URI-native string functions, pure and network-free ---
+
+// Classify turns any accepted input into the canonical (type, id).
+// For Gaia, any non-empty string is treated as a star source_id.
+func (Domain) Classify(input string) (uriType, id string, err error) {
+	if input == "" {
+		return "", "", errs.Usage("empty gaia reference")
+	}
+	return "star", input, nil
+}
+
+// Locate returns the TAP query URL for a star by source_id.
 func (Domain) Locate(uriType, id string) (string, error) {
-	if uriType != "page" {
+	if uriType != "star" {
 		return "", errs.Usage("gaia has no resource type %q", uriType)
 	}
-	return BaseURL + "/" + strings.Trim(id, "/"), nil
-}
-
-// --- helpers ---
-
-// pagePath turns any accepted input into the canonical page id: the path of a
-// full URL on this host, or a bare path with its slashes trimmed.
-func pagePath(input string) string {
-	input = strings.TrimSpace(input)
-	if u, err := url.Parse(input); err == nil && (u.Scheme == "http" || u.Scheme == "https") {
-		return strings.Trim(u.Path, "/")
-	}
-	return strings.Trim(input, "/")
-}
-
-// mapErr converts a library error into the kit error kind that carries the right
-// exit code, so a host renders the same outcomes the standalone binary does. As
-// you add sentinel errors to the library, map them here, for example:
-//
-//	case errors.Is(err, ErrNotFound):
-//		return errs.NotFound("%s", err.Error())
-//	case errors.Is(err, ErrRateLimited):
-//		return errs.RateLimited("%s", err.Error())
-func mapErr(err error) error {
-	return err
+	q := fmt.Sprintf("SELECT * FROM gaiadr3.gaia_source WHERE source_id=%s", id)
+	return tapEndpoint + "?REQUEST=doQuery&LANG=ADQL&FORMAT=json&QUERY=" + q, nil
 }
